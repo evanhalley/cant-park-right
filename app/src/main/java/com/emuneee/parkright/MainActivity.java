@@ -3,13 +3,15 @@ package com.emuneee.parkright;
 import android.app.Activity;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 
 import com.google.android.things.pio.Gpio;
+import com.google.android.things.pio.GpioCallback;
 import com.google.android.things.pio.PeripheralManagerService;
 
 import java.io.IOException;
-import java.util.concurrent.TimeUnit;
 
+import rx.AsyncEmitter;
 import rx.Observable;
 import rx.Subscription;
 import rx.android.schedulers.AndroidSchedulers;
@@ -18,22 +20,32 @@ import timber.log.Timber;
 
 public class MainActivity extends Activity {
 
+    private static final int RANGE_STOP = 30;
+    private static final int RANGE_SLOW = 45;
+    private static final int RANGE_PROCEED = 60;
+
     private static final String PIN_TRIGGER = "BCM21";
     private static final String PIN_ECHO = "BCM20";
     private static final String PIN_ALERT = "BCM4";
+    private static final String PIN_SLOW = "BCM19";
+    private static final String PIN_PROCEED = "BCM17";
 
-    private static final int TIMEOUT_MS = 2_000;
-    private static final int START_DURATION_NS = 10000;
-    private static final int INIT_DURATION_NS = 5000;
-    private static final int REFRESH_DURATION_MS = 1000;
+    private static final int REFRESH_DURATION_MS = 200;
+
+    private static final int START_DURATION_NS = 10_000;
+    private static final int INIT_DURATION_NS = 2_000;
+
     private static final double MAX_DISTANCE_CM = 500.0;
 
     private Gpio echoPin;
     private Gpio triggerPin;
     private Gpio alertPin;
+    private Gpio slowPin;
+    private Gpio proceedPin;
 
     private Subscription rangeSubscription;
-    PeripheralManagerService pioService;
+    private PeripheralManagerService pioService;
+    private Handler handler;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -42,16 +54,15 @@ public class MainActivity extends Activity {
         Timber.d("Android API Level: %d", Build.VERSION.SDK_INT);
         pioService = new PeripheralManagerService();
         configurePins();
+        handler = new Handler();
 
         rangeSubscription = initiateDetection()
+                .subscribeOn(Schedulers.computation())
                 .flatMap(this::calculateDistance)
-                .timeout(TIMEOUT_MS, TimeUnit.MILLISECONDS, Observable.just(MAX_DISTANCE_CM + 1))
-                .repeatWhen(c -> c.delay(REFRESH_DURATION_MS, TimeUnit.MILLISECONDS))
                 .observeOn(AndroidSchedulers.mainThread())
-                .subscribeOn(Schedulers.io())
                 .subscribe(distance -> {
 
-                    if (distance <= MAX_DISTANCE_CM) {
+                    if (distance > 0 && distance <= MAX_DISTANCE_CM) {
                         Timber.d("Distance (cm): %f", distance);
                         setAlert(distance);
                     }
@@ -76,6 +87,10 @@ public class MainActivity extends Activity {
         try {
             alertPin = pioService.openGpio(PIN_ALERT);
             alertPin.setDirection(Gpio.DIRECTION_OUT_INITIALLY_LOW);
+            slowPin = pioService.openGpio(PIN_SLOW);
+            slowPin.setDirection(Gpio.DIRECTION_OUT_INITIALLY_LOW);
+            proceedPin = pioService.openGpio(PIN_PROCEED);
+            proceedPin.setDirection(Gpio.DIRECTION_OUT_INITIALLY_LOW);
 
             triggerPin = pioService.openGpio(PIN_TRIGGER);
             triggerPin.setDirection(Gpio.DIRECTION_OUT_INITIALLY_LOW);
@@ -93,75 +108,105 @@ public class MainActivity extends Activity {
     private void setAlert(double distance) {
 
         try {
-            alertPin.setValue(distance < 30);
+
+            if (distance < RANGE_STOP) {
+                alertPin.setValue(true);
+                slowPin.setValue(false);
+                proceedPin.setValue(false);
+            } else if (distance >= RANGE_STOP && distance < RANGE_SLOW) {
+                alertPin.setValue(false);
+                slowPin.setValue(true);
+                proceedPin.setValue(false);
+            } else if (distance >= RANGE_PROCEED){
+                alertPin.setValue(false);
+                slowPin.setValue(false);
+                proceedPin.setValue(true);
+            }
         } catch (IOException e) {
             Timber.w(e, "Error in setAlert");
         }
-
     }
 
     /**
      * Initiates range detection, emits the detected pulse width
      * @return
      */
-    private Observable<Long> initiateDetection() {
+    private Observable<Double> initiateDetection() {
 
-        return Observable.create(subscriber -> {
-            int keepBusy = 0;
-            long echoStart;
-            long echoEnd;
+        return Observable.fromAsync(emitter -> {
+
+            GpioCallback echoCallback = new GpioCallback() {
+
+                private long echoStart;
+                private long echoEnd;
+
+                @Override
+                public boolean onGpioEdge(final Gpio gpio) {
+
+                    try {
+                        if (gpio.getValue()) {
+                            // edge is hi
+                            echoStart = System.nanoTime();
+                        } else {
+                            echoEnd = System.nanoTime();
+                            double pulseWidth = (echoEnd - echoStart) / 1000.0;
+                            Timber.d("Pulse width (uS) %f", pulseWidth);
+                            //Timber.d("Start %d, End %d, Pulse width (uS) %f", echoStart, echoEnd, pulseWidth);
+                            emitter.onNext(pulseWidth);
+                        }
+                    } catch (IOException e) {
+                        Timber.w(e, "Error in onGpioEdge");
+                        emitter.onError(e);
+                    }
+                    return true;
+                }
+
+                @Override
+                public void onGpioError(final Gpio gpio, final int error) {
+                    Timber.w("Gpio Error %d", error);
+                }
+            };
+
+            emitter.setCancellation(() -> echoPin.unregisterGpioCallback(echoCallback));
 
             try {
-                // initialize the trigger pins
-                triggerPin.setValue(false);
-                sleep(INIT_DURATION_NS);
+                echoPin.registerGpioCallback(echoCallback, handler);
 
-                // start detection
-                Timber.d("Triggering detection");
-                triggerPin.setValue(true);
-                sleep(START_DURATION_NS);
-                triggerPin.setValue(false);
+                while (true) {
+                    // initialize the trigger pins
+                    triggerPin.setValue(false);
+                    sleepInNs(INIT_DURATION_NS);
 
-                //// THIS BLOCK NEEDS TO BE AS QUICK AS POSSIBLE
-                // wait while we wait for the starting edge of the echo
-                while (!echoPin.getValue()) {
-                    keepBusy = 1;
+                    // start detection by raising the trigger signal for 10uS
+                    Timber.d("Triggering detection");
+                    triggerPin.setValue(true);
+                    sleepInNs(START_DURATION_NS);
+                    triggerPin.setValue(false);
+                    sleepInMs(REFRESH_DURATION_MS);
                 }
-                echoStart = System.nanoTime();
-
-                Timber.d("Edge hi!");
-
-                // wait while we wait for the ending edge of the echo
-                while (echoPin.getValue()) {
-                    keepBusy = 2;
-                }
-
-                echoEnd = System.nanoTime();
-                //// END BLOCK
-
-                long pulseWidth = echoEnd - echoStart;
-                Timber.d("Pulse width (ns) %d", pulseWidth);
-                subscriber.onNext(pulseWidth);
-                subscriber.onCompleted();
-
             } catch (Exception e) {
                 Timber.w(e, "Error in startDetection");
-                subscriber.onError(e);
+                emitter.onError(e);
             }
-        });
+
+        }, AsyncEmitter.BackpressureMode.BUFFER);
     }
 
     /**
      * Returns a distance in centimeters, based on the pulse width
-     * @param pulseWidth
+     * @param pulseWidthUs duration of the pulse in microseconds
      * @return
      */
-    private Observable<Double> calculateDistance(long pulseWidth) {
-        double distance = (pulseWidth / 1000.0) / 58.23;
+    private Observable<Double> calculateDistance(double pulseWidthUs) {
+        double distance = pulseWidthUs / 58.23;
         return Observable.just(distance);
     }
 
-    private void sleep(int timeInNs) throws InterruptedException {
+    private void sleepInNs(int timeInNs) throws InterruptedException {
         Thread.sleep(0, timeInNs);
+    }
+
+    private void sleepInMs(int timeInMs) throws InterruptedException {
+        Thread.sleep(timeInMs);
     }
 }
